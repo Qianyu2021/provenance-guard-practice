@@ -78,6 +78,30 @@ class AppTests(unittest.TestCase):
         self.assertGreaterEqual(row["llm_score"], 0.0)
         self.assertLessEqual(row["llm_score"], 1.0)
 
+    def test_log_endpoint_returns_recent_entries_newest_first(self):
+        first = self.client.post(
+            "/submit",
+            json={"text": "First travel note about the coast.", "creator_id": "u1"},
+        ).get_json()["content_id"]
+        second = self.client.post(
+            "/submit",
+            json={"text": "Second travel note about the mountains.", "creator_id": "u2"},
+        ).get_json()["content_id"]
+
+        response = self.client.get("/log")
+        self.assertEqual(response.status_code, 200)
+        entries = response.get_json()["entries"]
+
+        self.assertIsInstance(entries, list)
+        content_ids = [e["content_id"] for e in entries]
+        self.assertIn(first, content_ids)
+        self.assertIn(second, content_ids)
+        # Newest first: the second submission appears before the first.
+        self.assertLess(content_ids.index(second), content_ids.index(first))
+        for key in ("content_id", "creator_id", "timestamp", "attribution",
+                    "confidence", "llm_score", "status"):
+            self.assertIn(key, entries[0])
+
     def test_400_requests_are_not_logged(self):
         with audit_log._connect() as conn:
             before = conn.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]

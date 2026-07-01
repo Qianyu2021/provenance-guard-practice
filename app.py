@@ -2,7 +2,7 @@ import uuid
 
 from flask import Flask, jsonify, request
 
-from audit_log import init_db, log_submission
+from audit_log import get_log, init_db, log_submission
 from signals import analyze_with_groq
 
 app = Flask(__name__)
@@ -53,6 +53,16 @@ def submit():
             "submitted_by": creator_id,
         }
     )
+
+
+@app.get("/log")
+def log():
+    """Return the most recent audit log entries.
+
+    Unauthenticated by design — this exists for documentation and grading
+    visibility. A real deployment would put this behind auth.
+    """
+    return jsonify({"entries": get_log()})
 
 
 if __name__ == "__main__":

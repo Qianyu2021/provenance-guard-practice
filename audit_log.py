@@ -95,3 +95,19 @@ def log_submission(
         )
 
     return entry
+
+
+def get_log(limit: int = 50) -> list:
+    """Return the most recent audit log entries, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT content_id, creator_id, timestamp, attribution, confidence, llm_score, status
+            FROM audit_log
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
