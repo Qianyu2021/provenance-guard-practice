@@ -1,6 +1,7 @@
 import os
 import re
 from collections import Counter
+from statistics import mean, pstdev
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -9,6 +10,34 @@ from groq import Groq
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# --- Attribution thresholds (single source of truth; see planning.md step 2.2) ---
+# score >= 0.80          => likely AI
+# 0.25 <= score < 0.80   => uncertain
+# score <  0.25          => likely human
+AI_THRESHOLD = 0.80
+HUMAN_THRESHOLD = 0.25
+
+# --- Confidence scorer knobs (see planning.md step 2.2) ---
+# Signal 1 (perplexity/LLM) is the primary; signal 2 (burstiness) corroborates.
+W_PERPLEXITY = 0.6
+W_BURSTINESS = 0.4
+# When the two signals disagree, pull the combined score toward the neutral
+# midpoint (0.5). Full disagreement (|s1-s2|==1) removes half the distance to 0.5.
+DISAGREEMENT_PENALTY = 0.5
+# No single signal alone may produce a confident "AI" verdict: an AI verdict
+# (>= AI_THRESHOLD) requires BOTH signals to independently lean AI.
+AI_CORROBORATION_FLOOR = 0.60
+
+LABELS = {
+    "likely_ai": "Likely AI-generated",
+    "likely_human": "Likely human-written",
+    "uncertain": "Uncertain origin — this text may be AI-generated or human-written",
+}
+
+
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 def compute_perplexity_signal(text: str) -> float:
@@ -99,3 +128,181 @@ def analyze_with_groq(text: str) -> Dict[str, Any]:
             "result": "likely_ai" if fallback_score >= 0.8 else "likely_human" if fallback_score < 0.25 else "uncertain",
             "rationale": f"Groq request failed: {exc}; used heuristic fallback.",
         }
+
+
+# --------------------------------------------------------------------------- #
+# Signal 2 — Burstiness (structural variance)                                 #
+# --------------------------------------------------------------------------- #
+# Humans write in bursts: a long explanatory sentence, then a short punch, in
+# uneven paragraph blocks. LLMs default to steady, uniform, medium-length
+# sentences and even paragraphs. We quantify that with three stylometric
+# metrics, then fold them into one 0.0-1.0 score (0.0 = very human-like,
+# 1.0 = very AI-like). Reliability degrades below ~8 sentences, so short texts
+# are damped toward the neutral midpoint rather than allowed to look confident.
+# --------------------------------------------------------------------------- #
+
+# Sentence-length coefficient of variation: high CV (bursty) => human.
+_SENT_CV_HUMAN = 0.75   # CV >= this => fully human-like (0.0)
+_SENT_CV_AI = 0.15      # CV <= this => fully AI-like (1.0)
+# Paragraph-length coefficient of variation: uniform blocks => AI.
+_PARA_CV_HUMAN = 0.60
+_PARA_CV_AI = 0.10
+# Sentence-length spread (max-min)/mean: wide spread (short punches + long
+# runs) => human.
+_SPREAD_HUMAN = 1.20
+_SPREAD_AI = 0.30
+# Below this many sentences the signal carries little information.
+_RELIABLE_SENTENCE_COUNT = 8
+
+
+def _split_sentences(text: str) -> list:
+    """Split into sentences and return their word counts (non-empty only)."""
+    parts = re.split(r"[.!?]+", text)
+    lengths = []
+    for part in parts:
+        words = re.findall(r"\b\w+\b", part)
+        if words:
+            lengths.append(len(words))
+    return lengths
+
+
+def _split_paragraph_lengths(text: str) -> list:
+    """Return per-paragraph word counts, splitting on blank lines."""
+    paragraphs = re.split(r"\n\s*\n", text.strip())
+    lengths = []
+    for para in paragraphs:
+        words = re.findall(r"\b\w+\b", para)
+        if words:
+            lengths.append(len(words))
+    return lengths
+
+
+def _linear_ai_score(value: float, human_at: float, ai_at: float) -> float:
+    """Map a metric to AI-ness (0.0 human .. 1.0 AI) via a clamped linear ramp.
+
+    `human_at` is the value that reads as fully human; `ai_at` is fully AI. The
+    ramp handles either ordering (human_at may be greater or less than ai_at).
+    """
+    if human_at == ai_at:
+        return 0.5
+    return _clamp((human_at - value) / (human_at - ai_at))
+
+
+def burstiness_metrics(text: str) -> Dict[str, Any]:
+    """Compute the raw structural metrics behind signal 2 (for audit/logging)."""
+    sentence_lengths = _split_sentences(text) if isinstance(text, str) else []
+    n = len(sentence_lengths)
+
+    if n < 2:
+        # Not enough structure to measure variance at all.
+        return {
+            "sentence_count": n,
+            "sentence_cv": None,
+            "paragraph_cv": None,
+            "length_spread": None,
+            "reliable": False,
+        }
+
+    m = mean(sentence_lengths)
+    sentence_cv = pstdev(sentence_lengths) / m if m else 0.0
+    length_spread = (max(sentence_lengths) - min(sentence_lengths)) / m if m else 0.0
+
+    paragraph_lengths = _split_paragraph_lengths(text)
+    if len(paragraph_lengths) >= 2:
+        pm = mean(paragraph_lengths)
+        paragraph_cv = pstdev(paragraph_lengths) / pm if pm else 0.0
+    else:
+        paragraph_cv = None
+
+    return {
+        "sentence_count": n,
+        "sentence_cv": round(sentence_cv, 3),
+        "paragraph_cv": round(paragraph_cv, 3) if paragraph_cv is not None else None,
+        "length_spread": round(length_spread, 3),
+        "reliable": n >= _RELIABLE_SENTENCE_COUNT,
+    }
+
+
+def compute_burstiness_signal(text: str) -> float:
+    """Return a normalized 0.0-1.0 burstiness score (0.0 human .. 1.0 AI).
+
+    Combines three metrics: sentence-length coefficient of variation (primary),
+    paragraph-length uniformity, and sentence-length spread. Short texts are
+    damped toward the neutral midpoint (0.5) because the signal is unreliable
+    below ~8 sentences.
+    """
+    metrics = burstiness_metrics(text)
+    if metrics["sentence_cv"] is None:
+        return 0.5  # no usable structure => no information => neutral
+
+    ai_cv = _linear_ai_score(metrics["sentence_cv"], _SENT_CV_HUMAN, _SENT_CV_AI)
+    ai_spread = _linear_ai_score(metrics["length_spread"], _SPREAD_HUMAN, _SPREAD_AI)
+
+    if metrics["paragraph_cv"] is not None:
+        ai_para = _linear_ai_score(metrics["paragraph_cv"], _PARA_CV_HUMAN, _PARA_CV_AI)
+        raw = 0.50 * ai_cv + 0.25 * ai_para + 0.25 * ai_spread
+    else:
+        # Single paragraph: redistribute the paragraph weight onto the two
+        # sentence-level metrics.
+        raw = 0.65 * ai_cv + 0.35 * ai_spread
+
+    # Damp toward neutral for short texts: full weight at >= 8 sentences,
+    # linearly less below that, fully neutral at < 2 sentences.
+    n = metrics["sentence_count"]
+    reliability = _clamp((n - 1) / (_RELIABLE_SENTENCE_COUNT - 1))
+    score = 0.5 + (raw - 0.5) * reliability
+
+    return round(_clamp(score), 3)
+
+
+# --------------------------------------------------------------------------- #
+# Confidence scorer / aggregator                                              #
+# --------------------------------------------------------------------------- #
+
+
+def classify(score: float) -> str:
+    """Map a calibrated 0.0-1.0 confidence score to an attribution result.
+
+    This is the single place the planning-doc thresholds are applied.
+    """
+    if score >= AI_THRESHOLD:
+        return "likely_ai"
+    if score < HUMAN_THRESHOLD:
+        return "likely_human"
+    return "uncertain"
+
+
+def combine_signals(perplexity_score: float, burstiness_score: float) -> Dict[str, Any]:
+    """Combine signal 1 and signal 2 into one calibrated confidence decision.
+
+    Conservative weighted average, then a disagreement penalty that pulls the
+    result toward the neutral midpoint when the signals conflict. Enforces that
+    no single signal alone can push the result into the confident "AI" band.
+    """
+    s1 = _clamp(float(perplexity_score))
+    s2 = _clamp(float(burstiness_score))
+
+    base = W_PERPLEXITY * s1 + W_BURSTINESS * s2
+    disagreement = abs(s1 - s2)
+
+    # Pull toward 0.5 in proportion to how much the signals disagree.
+    score = base + (0.5 - base) * (disagreement * DISAGREEMENT_PENALTY)
+
+    # Bias against false "AI" accusations: a confident AI verdict requires both
+    # signals to independently lean AI. If either is below the floor, keep the
+    # score out of the AI band (park it just under the threshold).
+    corroborated = min(s1, s2) >= AI_CORROBORATION_FLOOR
+    if not corroborated and score >= AI_THRESHOLD:
+        score = AI_THRESHOLD - 0.01
+
+    score = round(_clamp(score), 3)
+    result = classify(score)
+
+    return {
+        "score": score,
+        "result": result,
+        "label_text": LABELS[result],
+        "disagreement": round(disagreement, 3),
+        "corroborated": corroborated,
+        "signal_scores": {"perplexity": s1, "burstiness": s2},
+    }
