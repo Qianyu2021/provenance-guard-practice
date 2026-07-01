@@ -139,6 +139,59 @@ class AppTests(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+class AppealWorkflowTests(unittest.TestCase):
+    """POST /appeal: capture reasoning, log it, flip status to 'under review'."""
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def _submit(self):
+        return self.client.post(
+            "/submit",
+            json={"text": "A quiet note from a rainy coastal town.", "creator_id": "appellant-1"},
+        ).get_json()["content_id"]
+
+    def test_appeal_updates_status_and_logs_reason(self):
+        content_id = self._submit()
+
+        response = self.client.post(
+            "/appeal",
+            json={
+                "content_id": content_id,
+                "submitter_id": "appellant-1",
+                "reason": "I wrote this by hand on a train; the label is wrong.",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["status"], "under review")
+        self.assertEqual(body["appeal"]["reason"],
+                         "I wrote this by hand on a train; the label is wrong.")
+        self.assertEqual(body["original_decision"]["content_id"], content_id)
+
+        # The audit_log row's status is now 'under review', original preserved.
+        decision = audit_log.get_decision(content_id)
+        self.assertEqual(decision["status"], "under review")
+
+        # The appeal is retrievable alongside the decision.
+        appeals = self.client.get("/log").get_json()["appeals"]
+        self.assertIn(content_id, [a["content_id"] for a in appeals])
+
+    def test_appeal_requires_fields(self):
+        content_id = self._submit()
+        # Missing reason.
+        r = self.client.post("/appeal",
+                             json={"content_id": content_id, "submitter_id": "x"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_appeal_unknown_content_id_is_404(self):
+        r = self.client.post(
+            "/appeal",
+            json={"content_id": "does-not-exist", "submitter_id": "x", "reason": "y"},
+        )
+        self.assertEqual(r.status_code, 404)
+
+
 class BurstinessSignalTests(unittest.TestCase):
     """Signal 2 tested independently, before integration."""
 

@@ -21,7 +21,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create the audit_log table if it does not already exist."""
+    """Create the audit_log and appeals tables if they do not already exist."""
     with _connect() as conn:
         conn.execute(
             """
@@ -40,6 +40,24 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_log_content_id "
             "ON audit_log (content_id)"
+        )
+        # Appeals live in their own table but reference the original decision by
+        # content_id, so an appeal is always logged alongside the decision it
+        # contests rather than replacing it.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appeals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_id    TEXT    NOT NULL,
+                submitter_id  TEXT,
+                timestamp     TEXT    NOT NULL,
+                reason        TEXT    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appeals_content_id "
+            "ON appeals (content_id)"
         )
 
 
@@ -95,6 +113,89 @@ def log_submission(
         )
 
     return entry
+
+
+def get_decision(content_id: str) -> Dict[str, Any]:
+    """Return the original decision record for a content_id, or None if unknown."""
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT content_id, creator_id, timestamp, attribution, confidence, llm_score, status
+            FROM audit_log
+            WHERE content_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (content_id,),
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def log_appeal(
+    *,
+    content_id: str,
+    submitter_id: str,
+    reason: str,
+    timestamp: str = None,
+) -> Dict[str, Any]:
+    """Record a creator's appeal and flip the decision's status to "under review".
+
+    The appeal is inserted into the appeals table (keyed by content_id, so it sits
+    alongside the original decision) and the matching audit_log row's status is
+    updated. The original decision is preserved untouched — no re-classification.
+
+    Returns a reviewer-queue view (original decision + appeal) or None if the
+    content_id has no prior decision to contest.
+    """
+    original = get_decision(content_id)
+    if original is None:
+        return None
+
+    ts = timestamp or utc_now_iso()
+    appeal = {
+        "content_id": content_id,
+        "submitter_id": submitter_id,
+        "timestamp": ts,
+        "reason": reason,
+    }
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO appeals (content_id, submitter_id, timestamp, reason)
+            VALUES (:content_id, :submitter_id, :timestamp, :reason)
+            """,
+            appeal,
+        )
+        conn.execute(
+            "UPDATE audit_log SET status = 'under review' WHERE content_id = ?",
+            (content_id,),
+        )
+
+    original["status"] = "under review"
+    return {
+        "content_id": content_id,
+        "status": "under review",
+        "appeal": appeal,
+        "original_decision": original,
+    }
+
+
+def get_appeals(limit: int = 50) -> list:
+    """Return the most recent appeals, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT content_id, submitter_id, timestamp, reason
+            FROM appeals
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
 
 
 def get_log(limit: int = 50) -> list:

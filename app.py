@@ -1,8 +1,17 @@
 import uuid
 
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
-from audit_log import get_log, init_db, log_submission
+from audit_log import (
+    get_appeals,
+    get_decision,
+    get_log,
+    init_db,
+    log_appeal,
+    log_submission,
+)
 from signals import (
     analyze_with_groq,
     burstiness_metrics,
@@ -12,10 +21,21 @@ from signals import (
 
 app = Flask(__name__)
 
+# Rate limiter keyed on client IP. In-memory storage is fine for local dev /
+# a single-process deployment; a real multi-worker deployment would point
+# storage_uri at Redis so counters are shared across workers.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
+
 init_db()
 
 
 @app.post("/submit")
+@limiter.limit("10 per minute;100 per day")
 def submit():
     """Submission endpoint: validate payload, run both signals, combine, label."""
     payload = request.get_json(silent=True) or {}
@@ -76,14 +96,46 @@ def submit():
     )
 
 
+@app.post("/appeal")
+def appeal():
+    """Appeals endpoint: a creator contests a classification.
+
+    Captures the creator's reasoning, logs it alongside the original decision,
+    and flips the content's status to "under review". No automatic
+    re-classification — the record is flagged for a human reviewer.
+    """
+    payload = request.get_json(silent=True) or {}
+    content_id = payload.get("content_id", "")
+    submitter_id = payload.get("submitter_id", "")
+    reason = payload.get("reason", "")
+
+    if not isinstance(content_id, str) or not content_id.strip():
+        return jsonify({"error": "content_id is required"}), 400
+    if not isinstance(submitter_id, str) or not submitter_id.strip():
+        return jsonify({"error": "submitter_id is required"}), 400
+    if not isinstance(reason, str) or not reason.strip():
+        return jsonify({"error": "reason is required"}), 400
+
+    if get_decision(content_id) is None:
+        return jsonify({"error": "no decision found for content_id"}), 404
+
+    review = log_appeal(
+        content_id=content_id,
+        submitter_id=submitter_id,
+        reason=reason,
+    )
+
+    return jsonify(review)
+
+
 @app.get("/log")
 def log():
-    """Return the most recent audit log entries.
+    """Return the most recent audit log entries and appeals.
 
     Unauthenticated by design — this exists for documentation and grading
     visibility. A real deployment would put this behind auth.
     """
-    return jsonify({"entries": get_log()})
+    return jsonify({"entries": get_log(), "appeals": get_appeals()})
 
 
 if __name__ == "__main__":
