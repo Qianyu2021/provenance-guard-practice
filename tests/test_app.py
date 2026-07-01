@@ -12,6 +12,7 @@ from app import app
 from signals import (
     AI_THRESHOLD,
     HUMAN_THRESHOLD,
+    LABELS,
     analyze_with_groq,
     classify,
     combine_signals,
@@ -188,6 +189,88 @@ class ConfidenceScorerTests(unittest.TestCase):
             self.assertFalse(out["corroborated"])
         # Once both corroborate, an AI verdict becomes reachable.
         self.assertEqual(combine_signals(1.0, 0.90)["result"], "likely_ai")
+
+
+class CalibrationTests(unittest.TestCase):
+    """Lock in the calibration observed on deliberately chosen inputs.
+
+    Uses representative (perplexity, burstiness) pairs (the reconciled signal
+    values seen on real texts) so the scorer's behavior is pinned without a
+    network call. See scratchpad/calibrate.py for the end-to-end run.
+    """
+
+    # (label, perplexity, burstiness) — perplexity is post-reconciliation.
+    SAMPLES = [
+        ("long_uniform_ai", 0.95, 0.98),   # both signals reliable + agree => AI
+        ("formal_human_short", 0.95, 0.54),  # strong perp, burst abstains => uncertain
+        ("edited_ai_short", 0.00, 0.53),   # signals disagree => uncertain
+        ("casual_human_short", 0.00, 0.31),  # leans human but short => low uncertain/human
+        ("long_bursty_human", 0.00, 0.00),  # both reliable + agree => human
+    ]
+
+    def test_all_three_labels_are_reachable(self):
+        results = {classify(combine_signals(p, b)["score"]) for _, p, b in self.SAMPLES}
+        self.assertEqual(results, {"likely_ai", "uncertain", "likely_human"})
+
+    def test_clearly_ai_outscores_clearly_human(self):
+        ai = combine_signals(0.95, 0.98)["score"]
+        human = combine_signals(0.00, 0.00)["score"]
+        self.assertGreaterEqual(ai, AI_THRESHOLD)
+        self.assertLess(human, HUMAN_THRESHOLD)
+        # Polished-uniform vs casual-irregular must be far apart, not clustered.
+        self.assertGreater(ai - human, 0.5)
+
+    def test_short_ai_stays_uncertain_without_corroboration(self):
+        # A confident AI verdict requires both signals; a lone strong perp on a
+        # short text (burst abstaining ~0.5) must not reach the AI band.
+        out = combine_signals(0.95, 0.51)
+        self.assertEqual(out["result"], "uncertain")
+        self.assertFalse(out["corroborated"])
+
+
+class TransparencyLabelTests(unittest.TestCase):
+    """Label generator: the three planning.md variants, driven by the score."""
+
+    def test_three_variants_are_distinct(self):
+        self.assertEqual(len(set(LABELS.values())), 3)
+
+    def test_each_score_band_yields_its_own_label(self):
+        # High score => AI label, mid => uncertain, low => human. The label must
+        # change with the score, not be constant.
+        ai = combine_signals(0.95, 0.98)["label_text"]
+        uncertain = combine_signals(0.95, 0.51)["label_text"]
+        human = combine_signals(0.00, 0.00)["label_text"]
+
+        self.assertEqual(ai, "Likely AI-generated")
+        self.assertEqual(human, "Likely human-written")
+        self.assertEqual(
+            uncertain,
+            "Uncertain origin — this text may be AI-generated or human-written",
+        )
+        self.assertEqual(len({ai, uncertain, human}), 3)
+
+    def test_label_always_matches_result_band(self):
+        for p, b in [(0.95, 0.98), (0.95, 0.51), (0.0, 0.53), (0.0, 0.0)]:
+            out = combine_signals(p, b)
+            self.assertEqual(out["label_text"], LABELS[out["result"]])
+
+
+class SubmitLabelTests(unittest.TestCase):
+    """End-to-end: the /submit response carries a score-derived label."""
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_submit_label_is_derived_from_score_not_hardcoded(self):
+        response = self.client.post(
+            "/submit",
+            json={"text": AI_UNIFORM, "creator_id": "creator-xyz"},
+        )
+        body = response.get_json()
+        # Whatever the live signals decide, the shown label must be the variant
+        # for the returned band -- proving it is generated, not a fixed string.
+        self.assertEqual(body["label_text"], LABELS[body["result"]])
+        self.assertIn(body["label_text"], set(LABELS.values()))
 
 
 if __name__ == "__main__":
